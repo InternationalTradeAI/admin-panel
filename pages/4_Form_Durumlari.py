@@ -3,49 +3,67 @@ import pandas as pd
 import psycopg2
 from db_config import get_connection
 
-# Sayfa başlığı
 st.title("Form Durumları")
 
 if "authenticated" not in st.session_state or not st.session_state.authenticated:
     st.warning("Bu sayfayı görmek için önce giriş yapmalısınız.")
     st.stop()
 
-# Veritabanından formların durumlarını alan fonksiyon
 @st.cache_data
 def get_form_statuses():
     conn = get_connection()
 
-    forms_df = pd.read_sql("SELECT id, created_at FROM forms;", conn)
-    profiles_df = pd.read_sql("SELECT form_id, content_id FROM profiles;", conn)
-    reports_df = pd.read_sql("SELECT content_id FROM evaluation_reports;", conn)
+    query = """
+    WITH content_counts AS (
+        SELECT form_id, COUNT(*) AS total_contents
+        FROM profiles
+        GROUP BY form_id
+    ),
+    evaluated_counts AS (
+        SELECT p.form_id, COUNT(*) AS evaluated_contents
+        FROM profiles p
+        JOIN evaluation_reports e ON p.content_id = e.content_id
+        GROUP BY p.form_id
+    ),
+    statuses AS (
+        SELECT
+            f.id AS form_id,
+            f.created_at,
+            COALESCE(cc.total_contents, 0) AS total,
+            COALESCE(ec.evaluated_contents, 0) AS evaluated,
+            CASE
+                WHEN cc.total_contents IS NULL THEN 'not_started'
+                WHEN COALESCE(ec.evaluated_contents, 0) = cc.total_contents THEN 'done'
+                WHEN COALESCE(ec.evaluated_contents, 0) > 0 THEN 'in_progress'
+                ELSE 'in_progress'
+            END AS status
+        FROM forms f
+        LEFT JOIN content_counts cc ON f.id = cc.form_id
+        LEFT JOIN evaluated_counts ec ON f.id = ec.form_id
+    )
+    SELECT * FROM statuses
+    ORDER BY created_at DESC;
+    """
 
+    df = pd.read_sql(query, conn)
     conn.close()
+    return df
 
-    # Başlangıçta tüm formlar 'not_started' kabul edilir
-    forms_df["status"] = "not_started"
-
-    # profiles tablosundaki form_id'ler → in_progress
-    profile_ids = profiles_df["form_id"].unique()
-    forms_df.loc[forms_df["id"].isin(profile_ids), "status"] = "in_progress"
-
-    # profiles + reports → done
-    merged = profiles_df.merge(reports_df, on="content_id", how="inner")
-    done_ids = merged["form_id"].unique()
-    forms_df.loc[forms_df["id"].isin(done_ids), "status"] = "done"
-
-    return forms_df.sort_values(by="created_at", ascending=False)
-
-# Veriyi al
+# Veri çek
 form_status_df = get_form_statuses()
 
-# Filtreleme: Duruma göre
-status_filter = st.multiselect("Duruma göre filtrele", ["done", "in_progress", "not_started"], default=["done", "in_progress", "not_started"])
+# Durum filtresi
+status_filter = st.multiselect(
+    "Duruma göre filtrele",
+    ["done", "in_progress", "not_started"],
+    default=["done", "in_progress", "not_started"]
+)
 filtered_df = form_status_df[form_status_df["status"].isin(status_filter)]
 
-# Göster
+# Gösterim
 st.dataframe(filtered_df, use_container_width=True)
 
-# Excel olarak indir
+# Excel indirme
 st.download_button(
     label="Excel Olarak İndir",
     data=filtered_df.to_csv(index=False).encode("utf-8"),
