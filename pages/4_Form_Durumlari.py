@@ -1,20 +1,19 @@
 import streamlit as st
 import pandas as pd
 import psycopg2
+from db_config import get_connection
 
 # Sayfa başlığı
 st.title("Form Durumları")
 
+if "authenticated" not in st.session_state or not st.session_state.authenticated:
+    st.warning("Bu sayfayı görmek için önce giriş yapmalısınız.")
+    st.stop()
+
 # Veritabanından formların durumlarını alan fonksiyon
 @st.cache_data
 def get_form_statuses():
-    conn = psycopg2.connect(
-        host="database-1.cdm486o0wi80.us-west-1.rds.amazonaws.com",
-        port="5432",
-        database="itai-demo",
-        user="readonly_user",
-        password="itaipass"
-    )
+    conn = get_connection()
 
     forms_df = pd.read_sql("SELECT id, created_at FROM forms;", conn)
     profiles_df = pd.read_sql("SELECT form_id, content_id FROM profiles;", conn)
