@@ -3,70 +3,74 @@ import pandas as pd
 import psycopg2
 from db_config import get_connection
 
-st.title("Form Durumları")
+st.title("Karşılaştırmalı Form Durumları")
 
 if "authenticated" not in st.session_state or not st.session_state.authenticated:
     st.warning("Bu sayfayı görmek için önce giriş yapmalısınız.")
     st.stop()
 
 @st.cache_data
-def get_form_statuses():
+def load_form_status_comparison():
     conn = get_connection()
 
-    query = """
-    WITH content_counts AS (
-        SELECT form_id, COUNT(*) AS total_contents
-        FROM profiles
-        GROUP BY form_id
-    ),
-    evaluated_counts AS (
-        SELECT p.form_id, COUNT(*) AS evaluated_contents
-        FROM profiles p
-        JOIN evaluation_reports e ON p.content_id = e.content_id
-        GROUP BY p.form_id
-    ),
-    statuses AS (
-        SELECT
-            f.id AS form_id,
-            f.created_at,
-            COALESCE(cc.total_contents, 0) AS total,
-            COALESCE(ec.evaluated_contents, 0) AS evaluated,
-            CASE
-                WHEN cc.total_contents IS NULL THEN 'not_started'
-                WHEN COALESCE(ec.evaluated_contents, 0) = cc.total_contents THEN 'done'
-                WHEN COALESCE(ec.evaluated_contents, 0) > 0 THEN 'in_progress'
-                ELSE 'in_progress'
-            END AS status
-        FROM forms f
-        LEFT JOIN content_counts cc ON f.id = cc.form_id
-        LEFT JOIN evaluated_counts ec ON f.id = ec.form_id
-    )
-    SELECT * FROM statuses
-    ORDER BY created_at DESC;
-    """
+    forms_df = pd.read_sql("SELECT id, created_at FROM forms;", conn)
+    profiles_df = pd.read_sql("SELECT form_id, content_id FROM profiles;", conn)
+    reports_df = pd.read_sql("SELECT content_id FROM evaluation_reports;", conn)
+    results_df = pd.read_sql("SELECT form_id, result_id FROM search_results;", conn)
+    content_df = pd.read_sql("SELECT search_result_id, status FROM website_content;", conn)
 
-    df = pd.read_sql(query, conn)
     conn.close()
-    return df
 
-# Veri çek
-form_status_df = get_form_statuses()
+    # Geliştirilmiş Algoritma 1: profile + report bazlı
+    forms_df["algo_1_status"] = "not_started"
+    prof_group = profiles_df.groupby("form_id")["content_id"].apply(list).reset_index()
+    evaluated_set = set(reports_df["content_id"])
 
-# Durum filtresi
-status_filter = st.multiselect(
-    "Duruma göre filtrele",
-    ["done", "in_progress", "not_started"],
-    default=["done", "in_progress", "not_started"]
-)
-filtered_df = form_status_df[form_status_df["status"].isin(status_filter)]
+    for _, row in prof_group.iterrows():
+        fid = row["form_id"]
+        cids = row["content_id"]
+        if any(cid in evaluated_set for cid in cids):
+            forms_df.loc[forms_df["id"] == fid, "algo_1_status"] = "done"
+        else:
+            forms_df.loc[forms_df["id"] == fid, "algo_1_status"] = "in_progress"
 
-# Gösterim
-st.dataframe(filtered_df, use_container_width=True)
+    # Geliştirilmiş Algoritma 2: search_result ve content status bazlı
+    extract_fail_status = ["EXTRACTED", "FAILED"]
+    result_counts = results_df.groupby("form_id").size().rename("total_search_count")
+    content_counts = (
+        content_df[content_df["status"].isin(extract_fail_status)]
+        .merge(results_df, left_on="search_result_id", right_on="result_id", how="left")
+        .groupby("form_id")
+        .size()
+        .rename("processed_count")
+    )
 
-# Excel indirme
+    merged_status = pd.concat([result_counts, content_counts], axis=1).fillna(0).astype(int)
+    forms_df = forms_df.merge(merged_status, how="left", left_on="id", right_index=True).fillna(0).astype({"total_search_count": int, "processed_count": int})
+
+    def determine_algo2(row):
+        if row["total_search_count"] == 0:
+            return "not_started"
+        elif row["processed_count"] >= row["total_search_count"]:
+            return "done"
+        elif row["processed_count"] > 0:
+            return "in_progress"
+        else:
+            return "not_started"
+
+    forms_df["algo_2_status"] = forms_df.apply(determine_algo2, axis=1)
+
+    # Çelişki var mı?
+    forms_df["disagreement"] = forms_df["algo_1_status"] != forms_df["algo_2_status"]
+
+    return forms_df[["id", "created_at", "algo_1_status", "algo_2_status", "disagreement", "total_search_count", "processed_count"]].sort_values(by="created_at", ascending=False)
+
+df = load_form_status_comparison()
+st.dataframe(df, use_container_width=True)
+
 st.download_button(
     label="Excel Olarak İndir",
-    data=filtered_df.to_csv(index=False).encode("utf-8"),
-    file_name="form_durumlari.csv",
+    data=df.to_csv(index=False).encode("utf-8"),
+    file_name="karsilastirma_durumlari.csv",
     mime="text/csv"
 )
