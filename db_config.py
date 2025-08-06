@@ -1,10 +1,15 @@
 import psycopg2
+import os
+from dotenv import load_dotenv
+
+# .env dosyasını yükle
+load_dotenv()
 
 def get_connection():
     return psycopg2.connect(
-        host="database-1.cdm486o0wi80.us-west-1.rds.amazonaws.com",
-        port=5432,
-        dbname="itai-demo",
-        user="readonly_user",
-        password="itaipass"
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD")
     )
