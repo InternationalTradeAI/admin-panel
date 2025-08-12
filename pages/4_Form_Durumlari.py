@@ -1,7 +1,7 @@
 import pandas as pd
 import streamlit as st
 import psycopg2
-from psycopg2.extras import execute_batch
+import json
 from db_config import get_connection
 
 st.title("Form Durumları ve Trade Score Özetleri")
@@ -18,94 +18,6 @@ def load_data():
     conn.close()
     return df_content, df_scores
 
-# --- DB tablo oluşturma ve kaydetme yardımcıları ---
-CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS form_status_summary (
-  form_id            BIGINT PRIMARY KEY,
-  total_count        BIGINT,
-  extracted_count    BIGINT,
-  failed_count       BIGINT,
-  failed_percent     NUMERIC(6,2),
-  status             TEXT,
-  avg_trade_score    NUMERIC(10,2),
-  top5_trade_scores  TEXT,
-  count_50_plus      BIGINT,
-  percent_50_plus    NUMERIC(6,2),
-  count_70_plus      BIGINT,
-  percent_70_plus    NUMERIC(6,2),
-  computed_at        TIMESTAMPTZ DEFAULT now()
-);
-"""
-
-UPSERT_SQL = """
-INSERT INTO form_status_summary
-(form_id, total_count, extracted_count, failed_count, failed_percent, status,
- avg_trade_score, top5_trade_scores, count_50_plus, percent_50_plus,
- count_70_plus, percent_70_plus, computed_at)
-VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
-ON CONFLICT (form_id) DO UPDATE SET
-  total_count       = EXCLUDED.total_count,
-  extracted_count   = EXCLUDED.extracted_count,
-  failed_count      = EXCLUDED.failed_count,
-  failed_percent    = EXCLUDED.failed_percent,
-  status            = EXCLUDED.status,
-  avg_trade_score   = EXCLUDED.avg_trade_score,
-  top5_trade_scores = EXCLUDED.top5_trade_scores,
-  count_50_plus     = EXCLUDED.count_50_plus,
-  percent_50_plus   = EXCLUDED.percent_50_plus,
-  count_70_plus     = EXCLUDED.count_70_plus,
-  percent_70_plus   = EXCLUDED.percent_70_plus,
-  computed_at       = now();
-"""
-
-def ensure_table(conn):
-    with conn.cursor() as cur:
-        cur.execute(CREATE_TABLE_SQL)
-    conn.commit()
-
-def save_summary_to_db(display_df: pd.DataFrame):
-    rows = []
-    for r in display_df.itertuples(index=False):
-        def pct_to_float(x):
-            if x in (None, 'N/A'): return None
-            s = str(x).strip().replace('%','')
-            return float(s) if s!='' else None
-
-        failed_percent  = pct_to_float(r.failed_yuzdesi)
-        p50             = pct_to_float(r.percent_50_plus)
-        p70             = pct_to_float(r.percent_70_plus)
-        avg_trade_score = None if r.ortalama_trade_score in (None, 'N/A') else float(r.ortalama_trade_score)
-        top5_text       = None if r.top5_trade_score in (None, 'N/A') else str(r.top5_trade_score)
-
-        rows.append((
-            int(r.form_id),
-            int(r.total_count) if pd.notna(r.total_count) else 0,
-            int(getattr(r, "EXTRACTED", 0) or 0),
-            int(getattr(r, "FAILED", 0) or 0),
-            failed_percent,
-            r.status,
-            avg_trade_score,
-            top5_text,
-            None if r.count_50_plus in (None, 'N/A') else int(r.count_50_plus),
-            p50,
-            None if r.count_70_plus in (None, 'N/A') else int(r.count_70_plus),
-            p70
-        ))
-
-    conn = get_connection()
-    try:
-        ensure_table(conn)
-        with conn.cursor() as cur:
-            execute_batch(cur, UPSERT_SQL, rows, page_size=500)
-        conn.commit()
-        st.success(f"{len(rows)} satır form_status_summary tablosuna yazıldı / güncellendi.")
-    except Exception as e:
-        st.error(f"DB yazma hatası: {e}\n(Not: readonly kullanıcıyla bu işlem yapılamaz.)")
-        conn.rollback()
-    finally:
-        conn.close()
-
-# --------- Veri hazırlama ----------
 df_content, df_scores = load_data()
 df_scores = df_scores.dropna(subset=["trade_score_int"])
 
@@ -139,6 +51,7 @@ def format_top5(fid):
     if not scores:
         return None
     return ", ".join(str(int(v)) for v in scores)
+
 summary["top5_trade_score"] = summary.index.map(format_top5)
 
 def compute_threshold_stats(fid):
@@ -182,17 +95,39 @@ for col in ["ortalama_trade_score", "count_50_plus", "count_70_plus", "top5_trad
 for col in ["percent_50_plus", "percent_70_plus"]:
     display_df[col] = display_df[col].fillna('N/A')
 
-# ---- UI: tablo + butonlar ----
+def pct_to_float(p):
+    if p in (None, "N/A"): return None
+    s = str(p).replace("%","").strip()
+    return float(s) if s else None
+
+def row_to_status_summary(r):
+    return {
+        "total_count": int(r.total_count) if pd.notna(r.total_count) else 0,
+        "extracted_count": int(getattr(r, "EXTRACTED", 0) or 0),
+        "failed_count": int(getattr(r, "FAILED", 0) or 0),
+        "failed_percent": pct_to_float(r.failed_yuzdesi),
+        "status": r.status,
+        "avg_trade_score": None if r.ortalama_trade_score in (None, "N/A") else float(r.ortalama_trade_score),
+        "top5_trade_scores": None if r.top5_trade_score in (None, "N/A") else [int(x.strip()) for x in str(r.top5_trade_score).split(",")],
+        "count_50_plus": None if r.count_50_plus in (None, "N/A") else int(r.count_50_plus),
+        "percent_50_plus": pct_to_float(r.percent_50_plus),
+        "count_70_plus": None if r.count_70_plus in (None, "N/A") else int(r.count_70_plus),
+        "percent_70_plus": pct_to_float(r.percent_70_plus)
+    }
+
+payload = {
+    "forms": [
+        {"form_id": int(r.form_id), "status_summary": row_to_status_summary(r)}
+        for r in display_df.itertuples(index=False)
+    ]
+}
+
 st.dataframe(display_df, use_container_width=True)
 
-c1, c2 = st.columns(2)
-with c1:
-    st.download_button(
-        label="CSV Olarak İndir",
-        data=display_df.to_csv(index=False).encode("utf-8"),
-        file_name="form_ozetleri.csv",
-        mime="text/csv"
-    )
-with c2:
-    if st.button("Özetleri DB'ye Kaydet"):
-        save_summary_to_db(display_df)
+json_bytes = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+st.download_button(
+    label="JSON Olarak İndir",
+    data=json_bytes,
+    file_name="form_status_summaries.json",
+    mime="application/json"
+)
